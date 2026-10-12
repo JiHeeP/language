@@ -138,6 +138,16 @@
     return lines.join("\n").trim();
   }
 
+  // 윈도우 메모장의 한글 txt 는 EUC-KR(CP949)인 경우가 많아 UTF-8 이 아니면 EUC-KR 로 다시 읽는다.
+  async function readTextFile(file) {
+    const buf = await file.arrayBuffer();
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(buf);
+    } catch {
+      return new TextDecoder("euc-kr").decode(buf);
+    }
+  }
+
   function errorMessage(code, data) {
     return (
       {
@@ -168,9 +178,11 @@
         <div id="tr-notice"></div>
         <section class="card">
           <label for="tr-src">원문</label>
-          <textarea id="tr-src" class="tr-src" rows="9" maxlength="${MAX_CHARS}" placeholder="가정통신문, 수업 안내, 알림장 등을 붙여 넣으세요."></textarea>
+          <textarea id="tr-src" class="tr-src" rows="9" maxlength="${MAX_CHARS}" placeholder="가정통신문, 수업 안내, 알림장 등을 붙여 넣거나 TXT 파일을 끌어다 놓으세요."></textarea>
           <div class="row" style="margin-top:6px">
             <button class="btn ghost small" id="tr-sample">예시 넣기</button>
+            <button class="btn ghost small" id="tr-file-btn">📂 TXT 파일 불러오기</button>
+            <input type="file" id="tr-file" accept=".txt,text/plain" hidden />
             <span class="help right" id="tr-count">0 / ${MAX_CHARS.toLocaleString()}자</span>
           </div>
           <div class="tr-opts">
@@ -382,6 +394,41 @@
         prompt("아래 내용을 복사하세요.", text);
       }
     }
+
+    async function loadFile(file) {
+      if (!file) return;
+      if (!/\.txt$/i.test(file.name) && file.type !== "text/plain") {
+        $status.textContent = "TXT 파일만 불러올 수 있어요.";
+        return;
+      }
+      try {
+        let text = (await readTextFile(file)).replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
+        let msg = `"${file.name}" 파일을 불러왔어요.`;
+        if (text.length > MAX_CHARS) {
+          text = text.slice(0, MAX_CHARS);
+          msg += ` ${MAX_CHARS.toLocaleString()}자가 넘어 앞부분만 넣었어요. 나머지는 나눠서 번역하세요.`;
+        }
+        $src.value = text;
+        updateCount();
+        $status.textContent = msg;
+      } catch (e) {
+        $status.textContent = "파일을 읽지 못했어요: " + e.message;
+      }
+    }
+
+    const $file = document.getElementById("tr-file");
+    document.getElementById("tr-file-btn").onclick = () => $file.click();
+    $file.onchange = () => {
+      loadFile($file.files[0]);
+      $file.value = ""; // 같은 파일을 다시 골라도 반영되도록
+    };
+    $src.addEventListener("dragover", (e) => e.preventDefault());
+    $src.addEventListener("drop", (e) => {
+      const f = e.dataTransfer?.files?.[0];
+      if (!f) return;
+      e.preventDefault();
+      loadFile(f);
+    });
 
     $src.addEventListener("input", updateCount);
     document.getElementById("tr-sample").onclick = () => {
