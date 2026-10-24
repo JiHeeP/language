@@ -1,6 +1,8 @@
 /* 한영 병기 번역·정리 + PDF 출력 페이지 (#translate) */
 (function () {
-  const MAX_CHARS = 6000;
+  const MAX_CHARS = 60000; // 전체 원문 상한. 서버는 한 번에 6000자까지만 받으므로 조각으로 나눠 보낸다.
+  const CHUNK_CHARS = 4500;
+  const MAX_VOCAB = 12;
   const DOCS_KEY = "trilingo-docs-v1";
   const PREFS_KEY = "trilingo-translate-prefs-v1";
   const MAX_DOCS = 10;
@@ -148,6 +150,51 @@
     }
   }
 
+  // 긴 원문을 문단 → 줄 → 문장 경계 순으로 CHUNK_CHARS 이하 조각으로 나눈다.
+  function splitText(text, limit = CHUNK_CHARS) {
+    const pieces = [];
+    const push = (t) => {
+      for (let i = 0; i < t.length; i += limit) pieces.push(t.slice(i, i + limit));
+    };
+    const breakDown = (para) => {
+      if (para.length <= limit) return [para];
+      const parts = para.split(/\n/).flatMap((l) => (l.length <= limit ? [l] : l.match(/[^.!?。！？]+[.!?。！？]*\s*/g) || [l]));
+      return parts;
+    };
+    for (const para of text.split(/\n{2,}/)) for (const part of breakDown(para)) push(part);
+    const chunks = [];
+    let cur = "";
+    for (const piece of pieces) {
+      if (cur && cur.length + piece.length + 2 > limit) {
+        chunks.push(cur.trim());
+        cur = "";
+      }
+      cur += (cur ? "\n\n" : "") + piece;
+    }
+    if (cur.trim()) chunks.push(cur.trim());
+    return chunks;
+  }
+
+  // 조각별 번역 결과를 하나의 문서로 합친다. 제목은 첫 조각, 어휘는 중복 없이 모은다.
+  function mergeDocs(docs) {
+    const seen = new Set();
+    const vocab = [];
+    for (const d of docs) {
+      for (const v of d.vocab || []) {
+        const key = (v.ko || v.en).toLowerCase();
+        if (seen.has(key) || vocab.length >= MAX_VOCAB) continue;
+        seen.add(key);
+        vocab.push(v);
+      }
+    }
+    return {
+      title_ko: docs[0].title_ko,
+      title_en: docs[0].title_en,
+      sections: docs.flatMap((d) => d.sections),
+      vocab,
+    };
+  }
+
   function errorMessage(code, data) {
     return (
       {
@@ -155,9 +202,9 @@
         bad_api_key: "OpenAI API 키가 잘못됐어요. 키를 다시 확인하세요.",
         no_credit: "OpenAI 잔액이 없어요. platform.openai.com 에서 충전하세요.",
         rate_limited: "요청이 너무 잦아요. 잠시 후 다시 시도하세요.",
-        too_long: `원문이 너무 길어요. ${MAX_CHARS.toLocaleString()}자 이하로 나눠서 넣어 주세요.`,
+        too_long: `원문이 너무 길어요. ${MAX_CHARS.toLocaleString()}자 이하로 넣어 주세요.`,
         empty_text: "원문을 입력하세요.",
-        output_truncated: "결과가 너무 길어 잘렸어요. 원문을 두 부분으로 나눠 주세요.",
+        output_truncated: "결과가 너무 길어 잘렸어요. 다시 시도해 주세요.",
         bad_model_output: "AI 결과 형식이 이상해요. 한 번 더 시도해 주세요.",
         upstream_unreachable: "OpenAI 서버에 연결하지 못했어요.",
         upstream_error: "OpenAI 오류: " + (data?.detail || ""),
@@ -327,23 +374,33 @@
       }
       $go.disabled = true;
       $notice.innerHTML = "";
-      $status.textContent = "번역·정리 중… 긴 글은 30초 이상 걸릴 수 있어요.";
+      const chunks = splitText(text);
+      const docs = [];
+      let model = "";
       try {
-        const res = await fetch("/api/translate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, tone: prefs.tone, vocab: prefs.vocab }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          const msg = errorMessage(data.error, data);
-          if (data.error === "no_api_key" || data.error === "bad_api_key" || data.error === "no_credit") {
-            $notice.innerHTML = `<div class="notice">🔑 ${esc(msg)}</div>`;
-            $status.textContent = "";
-          } else {
-            $status.textContent = msg;
+        for (let i = 0; i < chunks.length; i++) {
+          $status.textContent =
+            chunks.length > 1
+              ? `번역·정리 중… (${i + 1}/${chunks.length}) 긴 글은 몇 분 걸릴 수 있어요.`
+              : "번역·정리 중… 긴 글은 30초 이상 걸릴 수 있어요.";
+          const res = await fetch("/api/translate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: chunks[i], tone: prefs.tone, vocab: prefs.vocab }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            const msg = errorMessage(data.error, data);
+            if (data.error === "no_api_key" || data.error === "bad_api_key" || data.error === "no_credit") {
+              $notice.innerHTML = `<div class="notice">🔑 ${esc(msg)}</div>`;
+              $status.textContent = "";
+            } else {
+              $status.textContent = chunks.length > 1 ? `${i + 1}/${chunks.length} 부분에서 실패: ${msg}` : msg;
+            }
+            return;
           }
-          return;
+          docs.push(data.doc);
+          model = data.model;
         }
         current = {
           id: String(Date.now()),
@@ -352,8 +409,8 @@
           source: text,
           tone: prefs.tone,
           vocab: prefs.vocab,
-          doc: data.doc,
-          model: data.model,
+          doc: mergeDocs(docs),
+          model,
         };
         saveDoc(current);
         $status.textContent = "";
